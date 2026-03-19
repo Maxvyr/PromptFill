@@ -257,11 +257,18 @@ const ContentEditableEditor = React.forwardRef(({
         inLinePos = partEnd;
         
         if (part.startsWith('{{') && part.endsWith('}}')) {
-          // 光标在这个变量内？不 pill 化，保持纯文本
-          if (editingRange && partStart === editingRange.start && partEnd === editingRange.end) {
-            return escapeHTML(part);
-          }
           const rawInner = part.slice(2, -2);
+          // 光标在这个变量内？不 pill 化，但保留分类色文字
+          if (editingRange && partStart === editingRange.start && partEnd === editingRange.end) {
+            const { varPart } = parseInlineSyntax(rawInner);
+            const parsed = parseVariableName(varPart);
+            const baseKey = parsed.baseKey;
+            const bank = banks_[baseKey] || banks_[varPart];
+            const categoryId = bank?.category || 'other';
+            const colorKey = categories_[categoryId]?.color || 'slate';
+            const catStyle = CATEGORY_STYLES[colorKey];
+            return `<span class="${catStyle.text}" data-editing-var="true">${escapeHTML(part)}</span>`;
+          }
           return buildPillHTML(part, rawInner, banks_, categories_, isDark);
         }
         return escapeHTML(part);
