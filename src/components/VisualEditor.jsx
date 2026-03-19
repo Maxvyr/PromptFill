@@ -9,9 +9,6 @@ import { CATEGORY_STYLES } from '../constants/styles';
 const PILL_ATTR = 'data-pill-var';
 const PILL_REGEX = /(\{\{[^{}\n]+\}\})/g;
 
-/**
- * 将 contenteditable DOM 反序列化为纯文本（含 {{}} 语法）
- */
 function domToText(element) {
   if (!element) return '';
   let text = '';
@@ -31,10 +28,6 @@ function domToText(element) {
   return text;
 }
 
-/**
- * 获取当前光标在纯文本中的偏移位置
- * 返回 { start, end } 或 null
- */
 function getTextOffset(element) {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || !element) return null;
@@ -83,9 +76,6 @@ function getTextOffset(element) {
   };
 }
 
-/**
- * 将纯文本偏移转为 Range 并设置光标
- */
 function setTextOffset(element, start, end) {
   if (!element) return;
   if (end === undefined) end = start;
@@ -171,6 +161,34 @@ function escapeAttr(str) {
   return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/**
+ * 计算 pill 节点相对于 contenteditable 根元素的纯文本起止偏移
+ */
+function getPillTextRange(pillNode, rootElement) {
+  let pos = 0;
+  const walk = (node) => {
+    if (node === pillNode) return true;
+    if (node.nodeType === Node.TEXT_NODE) {
+      pos += node.textContent.length;
+    } else if (node.nodeType === Node.ELEMENT_NODE) {
+      if (node.hasAttribute(PILL_ATTR)) {
+        if (node === pillNode) return true;
+        pos += node.getAttribute(PILL_ATTR).length;
+      } else if (node.tagName === 'BR') {
+        pos += 1;
+      } else {
+        for (const child of node.childNodes) {
+          if (walk(child)) return true;
+        }
+      }
+    }
+    return false;
+  };
+  walk(rootElement);
+  const pillText = pillNode.getAttribute(PILL_ATTR);
+  return { start: pos, end: pos + pillText.length, text: pillText };
+}
+
 // ============================================================
 // ContentEditable 核心编辑器
 // ============================================================
@@ -183,6 +201,8 @@ const ContentEditableEditor = React.forwardRef(({
   isDarkMode,
   onInteraction,
   onFocus,
+  onUndo,
+  onRedo,
   className,
   style,
 }, forwardedRef) => {
@@ -191,7 +211,6 @@ const ContentEditableEditor = React.forwardRef(({
   const lastValueRef = useRef(value);
   const suppressSyncRef = useRef(false);
 
-  // 构建 pill 的 HTML 片段
   const buildPillHTML = useCallback((fullMatch, rawInner, banks_, categories_, isDark) => {
     const { varPart } = parseInlineSyntax(rawInner);
     const parsed = parseVariableName(varPart);
@@ -219,7 +238,6 @@ const ContentEditableEditor = React.forwardRef(({
     return `<span ${PILL_ATTR}="${escapedFullMatch}" data-export-pill="true" contenteditable="false" class="${pillClasses}" style="${pillStyle}display:inline;white-space:nowrap;font-size:inherit;line-height:inherit;vertical-align:baseline;cursor:default;"><span style="${bracketStyle}">{{</span>${escapeHTML(displayText)}<span style="${bracketStyle}">}}</span></span>`;
   }, []);
 
-  // 将纯文本渲染为带 pill 的 HTML
   const textToHTML = useCallback((text, banks_, categories_, isDark) => {
     if (!text) return '';
     const lines = text.split('\n');
@@ -266,6 +284,13 @@ const ContentEditableEditor = React.forwardRef(({
     }
   }, [value, banks, categories, isDarkMode, textToHTML]);
 
+  const emitChange = useCallback((newText) => {
+    lastValueRef.current = newText;
+    suppressSyncRef.current = true;
+    const syntheticEvent = { target: { value: newText } };
+    onChange(syntheticEvent);
+  }, [onChange]);
+
   // input 事件处理
   const handleInput = useCallback(() => {
     if (isComposingRef.current) return;
@@ -274,10 +299,7 @@ const ContentEditableEditor = React.forwardRef(({
     const newText = domToText(editableRef.current);
     if (newText === lastValueRef.current) return;
 
-    lastValueRef.current = newText;
-    suppressSyncRef.current = true;
-
-    // pill 化检测：如果用户刚完成一个 {{...}} 模式，重新渲染 DOM
+    // pill 化检测：如果文本中存在完整 {{...}} 模式，重新渲染 DOM 以生成 pill
     const needsPillify = PILL_REGEX.test(newText);
     PILL_REGEX.lastIndex = 0;
 
@@ -292,9 +314,8 @@ const ContentEditableEditor = React.forwardRef(({
       }
     }
 
-    const syntheticEvent = { target: { value: newText } };
-    onChange(syntheticEvent);
-  }, [onChange, banks, categories, isDarkMode, textToHTML]);
+    emitChange(newText);
+  }, [emitChange, banks, categories, isDarkMode, textToHTML]);
 
   const handleCompositionStart = useCallback(() => {
     isComposingRef.current = true;
@@ -311,12 +332,57 @@ const ContentEditableEditor = React.forwardRef(({
     document.execCommand('insertText', false, text);
   }, []);
 
+  // 双击 pill → 拆解为纯文本以支持编辑
+  const handleDoubleClick = useCallback((e) => {
+    const pillNode = e.target.closest?.(`[${PILL_ATTR}]`);
+    if (!pillNode || !editableRef.current) return;
+    if (!editableRef.current.contains(pillNode)) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const pillText = pillNode.getAttribute(PILL_ATTR);
+    const textNode = document.createTextNode(pillText);
+    pillNode.parentNode.replaceChild(textNode, pillNode);
+
+    // 光标定位到 }} 之前，方便编辑内联值
+    const cursorPos = pillText.length - 2;
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.setStart(textNode, cursorPos);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+
+    const newText = domToText(editableRef.current);
+    emitChange(newText);
+  }, [emitChange]);
+
   const handleKeyDown = useCallback((e) => {
+    // Cmd+Z / Ctrl+Z → 撤销
+    if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      if (onUndo) onUndo();
+      return;
+    }
+    // Cmd+Shift+Z / Ctrl+Shift+Z → 重做
+    if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
+      e.preventDefault();
+      if (onRedo) onRedo();
+      return;
+    }
+    // Cmd+Y / Ctrl+Y → 重做（Windows 习惯）
+    if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
+      e.preventDefault();
+      if (onRedo) onRedo();
+      return;
+    }
+
     if (e.key === 'Enter') {
       e.preventDefault();
       document.execCommand('insertLineBreak');
     }
-  }, []);
+  }, [onUndo, onRedo]);
 
   const handleFocusEvent = useCallback(() => {
     if (onFocus) onFocus();
@@ -327,7 +393,6 @@ const ContentEditableEditor = React.forwardRef(({
     if (onInteraction) onInteraction();
   }, [onInteraction]);
 
-  // 暴露兼容 textarea 的 API
   useImperativeHandle(forwardedRef, () => ({
     get value() { return domToText(editableRef.current); },
     get selectionStart() {
@@ -360,6 +425,7 @@ const ContentEditableEditor = React.forwardRef(({
       onCompositionEnd={handleCompositionEnd}
       onPaste={handlePaste}
       onKeyDown={handleKeyDown}
+      onDoubleClick={handleDoubleClick}
       onFocus={handleFocusEvent}
       onClick={handleClick}
       spellCheck={false}
@@ -387,6 +453,8 @@ export const VisualEditor = React.forwardRef(({
   language,
   t,
   onInteraction,
+  onUndo,
+  onRedo,
 }, ref) => {
   const containerRef = useRef(null);
   const isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
@@ -434,6 +502,8 @@ export const VisualEditor = React.forwardRef(({
             categories={categories}
             isDarkMode={isDarkMode}
             onInteraction={onInteraction}
+            onUndo={onUndo}
+            onRedo={onRedo}
             className={editorBaseClass}
             style={{ ...editorStyle, minHeight: '200px' }}
           />
@@ -453,6 +523,8 @@ export const VisualEditor = React.forwardRef(({
         categories={categories}
         isDarkMode={isDarkMode}
         onInteraction={onInteraction}
+        onUndo={onUndo}
+        onRedo={onRedo}
         className={`${editorBaseClass} p-8 overflow-y-auto`}
         style={{ ...editorStyle, height: '100%' }}
       />
